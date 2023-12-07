@@ -10,7 +10,7 @@ try:
     from detectron2.engine import DefaultPredictor
     DETECTRON_INSTALLED = True
 except:
-    print("Detectron v2 is not installed")
+    #print("Detectron v2 is not installed")
     DETECTRON_INSTALLED = False
 
 from .countless.countless2d import zero_corrected_countless

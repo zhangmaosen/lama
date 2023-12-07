@@ -61,6 +61,8 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
                  **kwargs):
         super().__init__(*args, **kwargs)
         LOGGER.info('BaseInpaintingTrainingModule init called')
+        self.validation_step_outputs = [] # upgrade lightning
+        self.automatic_optimization = False
 
         self.config = config
 
@@ -144,9 +146,9 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
 
         return res
 
-    def training_step(self, batch, batch_idx, optimizer_idx=None):
+    def training_step(self, batch, batch_idx):
         self._is_training_step = True
-        return self._do_step(batch, batch_idx, mode='train', optimizer_idx=optimizer_idx)
+        return self._do_step(batch, batch_idx, mode='train')
 
     def validation_step(self, batch, batch_idx, dataloader_idx):
         extra_val_key = None
@@ -158,9 +160,13 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
             mode = 'extra_val'
             extra_val_key = self.extra_val_titles[dataloader_idx - 2]
         self._is_training_step = False
-        return self._do_step(batch, batch_idx, mode=mode, extra_val_key=extra_val_key)
 
-    def training_step_end(self, batch_parts_outputs):
+        loss = self._do_step(batch, batch_idx, mode=mode, extra_val_key=extra_val_key)
+        self.validation_step_outputs.append(loss)
+        return loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        batch_parts_outputs = outputs
         if self.training and self.average_generator \
                 and self.global_step >= self.average_generator_start_step \
                 and self.global_step >= self.last_generator_averaging_step + self.average_generator_period:
@@ -177,8 +183,9 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
         self.log_dict(log_info, on_step=True, on_epoch=False)
         return full_loss
 
-    def validation_epoch_end(self, outputs):
-        outputs = [step_out for out_group in outputs for step_out in out_group]
+    def on_validation_epoch_end(self):
+        outputs = self.validation_step_outputs
+        #outputs = [step_out for out_group in outputs for step_out in out_group]
         averaged_logs = average_dicts(step_out['log_info'] for step_out in outputs)
         self.log_dict({k: v.mean() for k, v in averaged_logs.items()})
 
@@ -221,25 +228,42 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
                 for k, v in flatten_dict(cur_evaluator_res).items():
                     self.log(f'extra_val_{cur_eval_title}_{k}', v)
 
-    def _do_step(self, batch, batch_idx, mode='train', optimizer_idx=None, extra_val_key=None):
-        if optimizer_idx == 0:  # step for generator
-            set_requires_grad(self.generator, True)
-            set_requires_grad(self.discriminator, False)
-        elif optimizer_idx == 1:  # step for discriminator
-            set_requires_grad(self.generator, False)
-            set_requires_grad(self.discriminator, True)
+    def _do_step(self, batch, batch_idx, mode='train',  extra_val_key=None):
+        [g_opt, d_opt] = self.optimizers()
+        # if optimizer_idx == 0:  # step for generator
+            
+        # elif optimizer_idx == 1:  # step for discriminator
+        result = {}
+        result_d = None
+        result_g = None
 
         batch = self(batch)
+        metrics_prefix = f'{mode}_'
 
         total_loss = 0
         metrics = {}
 
-        if optimizer_idx is None or optimizer_idx == 0:  # step for generator
-            total_loss, metrics = self.generator_loss(batch)
+        #if optimizer_idx is None or optimizer_idx == 0:  # step for generator
+        #set_requires_grad(self.generator, True)
+        #set_requires_grad(self.discriminator, False)
+        total_loss, metrics = self.generator_loss(batch)
+        result_g = dict(loss=total_loss, log_info=add_prefix_to_keys(metrics, metrics_prefix))
+        if mode == 'train':
+            g_opt.zero_grad()
+            self.manual_backward(total_loss)
+            g_opt.step()
 
-        elif optimizer_idx is None or optimizer_idx == 1:  # step for discriminator
+        #elif optimizer_idx is None or optimizer_idx == 1:  # step for discriminator
+        #set_requires_grad(self.generator, False)
+        #set_requires_grad(self.discriminator, True)
+        if mode == 'train':
             if self.config.losses.adversarial.weight > 0:
                 total_loss, metrics = self.discriminator_loss(batch)
+                result_d = dict(loss=total_loss, log_info=add_prefix_to_keys(metrics, metrics_prefix))
+                if mode == 'train':
+                    d_opt.zero_grad()
+                    self.manual_backward(total_loss)
+                    d_opt.step()
 
         if self.get_ddp_rank() in (None, 0) and (batch_idx % self.visualize_each_iters == 0 or mode == 'test'):
             if self.config.losses.adversarial.weight > 0:
@@ -251,10 +275,11 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
                 vis_suffix += f'_{extra_val_key}'
             self.visualizer(self.current_epoch, batch_idx, batch, suffix=vis_suffix)
 
-        metrics_prefix = f'{mode}_'
+        
         if mode == 'extra_val':
             metrics_prefix += f'{extra_val_key}_'
-        result = dict(loss=total_loss, log_info=add_prefix_to_keys(metrics, metrics_prefix))
+        #result = dict(loss=total_loss, log_info=add_prefix_to_keys(metrics, metrics_prefix))
+        result = self.merge_g_d_loss(result_g, result_d)
         if mode == 'val':
             result['val_evaluator_state'] = self.val_evaluator.process_batch(batch)
         elif mode == 'test':
@@ -262,7 +287,17 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
         elif mode == 'extra_val':
             result[f'extra_val_{extra_val_key}_evaluator_state'] = self.extra_evaluators[extra_val_key].process_batch(batch)
 
+        
         return result
+
+
+    def merge_g_d_loss(self, g_loss, d_loss):
+        if d_loss is None:
+            return g_loss
+        loss = g_loss['loss'] + d_loss['loss']
+        log_info = g_loss['log_info'] | d_loss['log_info']
+
+        return dict(loss=loss, log_info=log_info)
 
     def get_current_generator(self, no_average=False):
         if not no_average and not self.training and self.average_generator and self.generator_average is not None:
@@ -288,4 +323,4 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
         batch['discr_output_diff'] = batch['discr_output_real'] - batch['discr_output_fake']
 
     def get_ddp_rank(self):
-        return self.trainer.global_rank if (self.trainer.num_nodes * self.trainer.num_processes) > 1 else None
+        return self.trainer.global_rank if (self.trainer.num_nodes * self.trainer.num_devices ) > 1 else None
